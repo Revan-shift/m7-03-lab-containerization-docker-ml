@@ -4,147 +4,175 @@
 
 ## Overview
 
-You will take your **cat-detection ONNX model** from the m6-09 Week-2 assessment and wrap it in a slim, multi-stage Docker image that proves the model loads on the target runtime. The container's job is to be a **model verifier**: `docker run --rm <image>` loads the model with ONNX Runtime and prints its metadata. Exit 0 on success, exit 1 on failure. That's the entire contract.
+You'll take your **cat-detection ONNX model** from the m6-09 Week-2 assessment and ship it inside a slim, multi-stage Docker image. **The repo already includes a working Dockerfile** — this lab is about reading it, understanding it, modifying it, and shipping the result. That's how junior platform engineers actually learn Docker on the job: read existing Dockerfiles, modify them, observe the build.
 
-This is a 90-minute hands-on lab. You will write a Dockerfile and a `.dockerignore`, then run Docker / curl-free commands. **No Python**. No HTTP server — Day 4 (API contracts) and Day 5 (serving at scale) cover that. Day 3 is about packaging, full stop.
-
-The serving stack is **ONNX Runtime's C API** plus a 27-line C program (provided — you don't need to read it, just compile it). The result is a real, slim runtime image, not a 1.5 GB beast.
+This is a 90-minute hands-on lab. **No Python**. No HTTP server (Day 4 covers contracts; Day 5 covers serving at scale). The container's job is to be a *model verifier* — `docker run --rm <image>` loads the model with ONNX Runtime's C API and exits 0 if it parsed, 1 if not.
 
 ## Learning Goals
 
 By the end of this lab you should be able to:
 
-- Write a multi-stage Dockerfile where stage 1 is a real builder and stage 2 is a slim runtime
-- Decide what belongs in stage 1 versus stage 2 (build tools, shared libraries, the model artifact)
-- Run the container as a non-root user
-- Build, tag, push, and verify a working containerized model artifact
+- Read a multi-stage Dockerfile and explain what each stage exists for
+- Modify a Dockerfile to add provenance metadata, pin a base image by digest, and wire up a HEALTHCHECK
+- Build, tag, push, and verify a public container image that runs as a non-root user under ~250 MB
 
 ## Setup
 
 You need:
 
-- Docker Desktop or Docker Engine installed locally (`docker --version` should work)
-- A free account on **Docker Hub** ([hub.docker.com](https://hub.docker.com)) **or** **GitHub Container Registry** (your existing GitHub account works)
-- Your **`model.onnx`** from the m6-09 assessment (YOLO26 export). If you didn't keep a local copy, grab it from your m6-09 lab repo.
+- Docker Desktop or Docker Engine (`docker --version` should work)
+- A free account on **Docker Hub** or **GitHub Container Registry** (your GitHub account works)
+- Your **`model.onnx`** from the m6-09 assessment (YOLO26 export). If you didn't keep a copy, grab it from your m6-09 lab repo.
 
-Fork and clone this lab repo. It contains:
+Fork and clone this repo. It contains:
 
-- `src/check_model.c` — a 27-line C program that uses the ONNX Runtime C API to load a model and print its input/output counts. Compiled in stage 1, shipped in stage 2.
+```
+Dockerfile               # working reference — you'll modify this
+.dockerignore            # working — adjust if you change scope
+.gitignore               # already excludes model.onnx
+src/
+└── check_model.c        # 27-line C verifier — do not modify
+```
 
-Drop your `model.onnx` into the repo root before building. **Do not commit `model.onnx`** — it's bytes that belong in the container, not in source control. Add it to `.dockerignore`'s opposite: keep it OUT of git, IN the build context.
+Drop your `model.onnx` into the repo root before building. It's gitignored, so it won't be committed.
 
 ## Tasks
 
-### Task 1 — `.gitignore`, `.dockerignore`, and getting the model in place
+### Task 1 — Run the reference build, baseline the image
 
-1. Copy your `model.onnx` from m6-09 into this repo's root directory.
-2. Add `model.onnx` to **`.gitignore`** so it doesn't get committed (it's likely tens of MB and binary).
-3. Create **`.dockerignore`** that excludes `.git/`, docs, the README, anything not needed inside the image. **Do not** ignore `model.onnx` or `src/` — the build needs both.
+1. Copy your `model.onnx` into the repo root.
+2. Build the image as-is:
+   ```bash
+   docker build -t <your-namespace>/m7-03-cat-detection:v1 .
+   ```
+3. Run it and confirm the verifier loads your model:
+   ```bash
+   docker run --rm <your-namespace>/m7-03-cat-detection:v1
+   ```
+   Expected output (your input/output counts may differ):
+   ```
+   ONNX model loaded OK: /home/app/model.onnx
+     inputs:  1
+     outputs: 1
+   ```
+4. Note the **baseline image size** from `docker images` — write it down; you'll compare against your final version.
 
-### Task 2 — Multi-stage Dockerfile
+If the reference build fails on your machine, that's a Task-1 deliverable: read the error, fix it, and write a one-paragraph post-mortem in `DOCKERFILE_NOTES.md` under a `## Baseline build` heading. (Most failures will be a stale Debian mirror or a corrupted ONNX Runtime download — try a retry first.)
 
-Create `Dockerfile` at the repo root. Requirements:
+### Task 2 — Annotate the Dockerfile
 
-**Stage 1 — `builder`** (the heavy stage; thrown away after build):
+Create `DOCKERFILE_NOTES.md` and write a short, opinionated read-through. Required sections:
 
-- Base: `debian:12-slim` (or equivalent slim Debian/Ubuntu).
-- Install build tools: `build-essential`, `ca-certificates`, `curl`.
-- Fetch the official ONNX Runtime release tarball from GitHub:
-  ```
-  https://github.com/microsoft/onnxruntime/releases/download/v1.20.1/onnxruntime-linux-x64-1.20.1.tgz
-  ```
-  Pin the version with a `ARG ORT_VERSION=1.20.1` so it's a single line to bump. Extract to `/opt/onnxruntime`.
-- Copy `src/check_model.c` and compile it against the extracted library:
-  ```
-  gcc -O2 -o /out/check_model src/check_model.c \
-      -I/opt/onnxruntime/include \
-      -L/opt/onnxruntime/lib \
-      -lonnxruntime
-  ```
-- Copy your `model.onnx` into the stage. **Validate it** in the build itself — fail the build if it's missing, empty, or not a real ONNX file. A simple gate works:
-  ```
-  RUN test -s /tmp/model.onnx && \
-      file /tmp/model.onnx | grep -qi onnx && \
-      echo "Model SHA-256: $(sha256sum /tmp/model.onnx | awk '{print $1}')"
-  ```
+```markdown
+# Dockerfile Notes
 
-**Stage 2 — `runtime`** (what you actually ship):
+## Baseline build
+- Image size: <MB>
+- Output of `docker run --rm <image>`:
+  <pasted>
 
-- Base: `debian:12-slim`.
-- Install **only** the runtime dependencies — `ca-certificates`, `libstdc++6`. No compilers, no headers, no curl.
-- Create a non-root user (uid 1001), `USER` it.
-- Copy from stage 1:
-  - the compiled `check_model` binary into `/usr/local/bin/`
-  - `libonnxruntime.so*` from `/opt/onnxruntime/lib/` into `/usr/local/lib/`
-  - the validated `model.onnx` into `/home/app/` with `--chown=app:app`
-- Set `ENV LD_LIBRARY_PATH=/usr/local/lib` so the binary can find the shared library.
-- `CMD ["check_model", "/home/app/model.onnx"]`.
+## Stage 1 (builder) — why it exists
+<one paragraph>
 
-Aim for a **final image under ~250 MB**. The .so file is ~60 MB; the Debian base is ~75 MB; the model varies. With aggressive cleanup, sub-200 MB is realistic.
+## Stage 2 (runtime) — why it exists
+<one paragraph>
 
-### Task 3 — Build, push, and verify
-
-From the repo root (with your `model.onnx` in place):
-
-```bash
-# 1. Build
-docker build -t <your-namespace>/m7-03-cat-detection:v1 .
-
-# 2. Inspect the image size (write it down — you'll report it)
-docker images <your-namespace>/m7-03-cat-detection:v1
-
-# 3. Verify it actually runs and loads your model
-docker run --rm <your-namespace>/m7-03-cat-detection:v1
-# Expected output (your numbers will differ for inputs/outputs):
-#   ONNX model loaded OK: /home/app/model.onnx
-#     inputs:  1
-#     outputs: 1
-
-# 4. Verify the user is non-root
-docker run --rm --entrypoint /bin/sh <your-namespace>/m7-03-cat-detection:v1 -c id
-# Expected: uid=1001(app) gid=1001(app) groups=1001(app)
-
-# 5. Push to a public registry
-docker login                                                # or: docker login ghcr.io
-docker push <your-namespace>/m7-03-cat-detection:v1
+## Three architectural decisions in this Dockerfile
+1. <name + 1-sentence "what would break if you removed it">
+2. <name + 1-sentence "what would break if you removed it">
+3. <name + 1-sentence "what would break if you removed it">
 ```
 
-Your image **must be public** so reviewers can pull it without credentials. Make the repository public in the registry UI.
+Concrete prompts to choose from for the "three architectural decisions": multi-stage split, `--no-install-recommends`, the `apt-get … && rm -rf /var/lib/apt/lists/*` pattern, the validation gate (`file | grep -qi onnx`), copying the .so with a glob (`libonnxruntime.so*`) instead of one file, `LD_LIBRARY_PATH`, the non-root user, the position of `COPY model.onnx` in the build (cache impact).
 
-Then update the repo `README.md` with a section titled `## Image` containing **exactly** these four items:
+Pick the three you find most consequential. Defend the choice.
 
-1. **Pull command** — a fenced shell block with the working `docker pull <fully-qualified-image>:v1`
-2. **Run command** — a fenced shell block with the working `docker run --rm <image>`
-3. **Image size** — final image size in MB (from `docker images`)
-4. **Sample output** — the actual stdout you saw when you ran the image (model path + input/output counts)
+### Task 3 — Make three improvements
 
-These four items must let any reviewer with Docker installed verify your image works in under 30 seconds.
+Modify the `Dockerfile` to add **all three** of these. Each is a small, real improvement a platform team would actually ship.
+
+**3a. Add provenance LABELs to stage 2.**
+
+```dockerfile
+LABEL model.source="m6-09-assessment"
+LABEL model.framework="ultralytics-yolo26"
+LABEL ort.version="${ORT_VERSION}"
+LABEL maintainer="<your-github-handle>"
+```
+
+Verify with `docker image inspect <image> --format '{{json .Config.Labels}}'`.
+
+**3b. Pin the Debian base image by digest in both stages.**
+
+Replace `FROM debian:12-slim` with `FROM debian:12-slim@sha256:<digest>`. Get the current digest:
+
+```bash
+docker pull debian:12-slim
+docker inspect --format '{{index .RepoDigests 0}}' debian:12-slim
+```
+
+Use the printed digest. Both stages must pin to the same digest. (This is supply-chain hygiene — tag-based pulls can drift; digests can't.)
+
+**3c. Add a HEALTHCHECK to stage 2.**
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD check_model /home/app/model.onnx || exit 1
+```
+
+(For a verifier container the HEALTHCHECK is the same command as CMD — fine for this lab. In a real serving container it would hit a `/health` endpoint.)
+
+Rebuild after each change. Verify each one works:
+
+```bash
+docker build -t <your-namespace>/m7-03-cat-detection:v2 .
+docker run --rm <your-namespace>/m7-03-cat-detection:v2          # still loads
+docker inspect <your-namespace>/m7-03-cat-detection:v2 --format '{{.Config.Healthcheck}}'
+docker inspect <your-namespace>/m7-03-cat-detection:v2 --format '{{json .Config.Labels}}' | jq .
+```
+
+Record the v2 image size in `DOCKERFILE_NOTES.md` under `## Final build` along with a paste of the labels and the healthcheck spec.
+
+### Task 4 — Push and document
+
+```bash
+docker login                       # or: docker login ghcr.io
+docker push <your-namespace>/m7-03-cat-detection:v2
+```
+
+The image must be **public**.
+
+Update this README in the section titled `## Image` (add it at the bottom) with exactly these four items:
+
+1. **Pull command** — fenced shell block with the working `docker pull` command
+2. **Run command** — fenced shell block with `docker run --rm <image>`
+3. **Image size** — final image size in MB
+4. **Sample output** — the actual stdout from running your image
 
 ## Submission
 
 Open a Pull Request to the lab repository with:
 
 ```
-Dockerfile
-.dockerignore
-.gitignore                # adding model.onnx to it
-README.md                 # with the ## Image section completed
-src/check_model.c         # already in the starter; do not modify
+Dockerfile                  # your modified version (v2)
+.dockerignore               # adjust only if you changed scope
+.gitignore                  # already in starter
+DOCKERFILE_NOTES.md         # NEW — your annotations and observations
+README.md                   # with the ## Image section completed
+src/check_model.c           # unchanged
 ```
 
-**Do not commit `model.onnx`** to the lab repo. Paste the PR link as your deliverable. The PR description must include the public `docker pull` command on its own line.
+**Do not commit `model.onnx`.** Paste the PR link as your deliverable. The PR description must include the public `docker pull` command on its own line.
 
 ## Quality bar
 
 You will be reviewed on:
 
-- **Does the image actually run** when pulled fresh and started with the documented `docker run`?
-- **Is it truly multi-stage?** Stage 1 must contain `build-essential` and `curl`; stage 2 must not.
-- **Is the final image under ~250 MB?** A 1.5 GB image with a 5 MB model fails this bar.
-- **Is stage 1 a real validation gate?** It must fail the build if `model.onnx` is missing, empty, or not actually an ONNX file.
+- **Does the image actually run** when pulled fresh, and produce the expected stdout?
+- **All three improvements applied:** LABELs visible, base pinned by digest, HEALTHCHECK present? Inspecting the image must prove each one.
+- **Are the annotations specific?** "It's multi-stage so the image is smaller" fails the bar. "Without stage 1's build-essential we couldn't compile check_model; without stage 2 discarding it we'd ship a 600 MB image" passes.
+- **Is the final image under ~250 MB?** A non-multi-stage build would be ~600 MB; if you're there, the change didn't land.
 - **Is the user non-root?** `docker run --rm --entrypoint /bin/sh <image> -c id` must show uid 1001.
-- **Is the image public?** A registry that asks for login fails the bar.
-- **Is `.dockerignore` actually filtering things out?** No `.git/`, no docs, no junk.
-- **Does the container exit cleanly?** Exit code 0 on success; exit 1 (with a useful message) if the model can't load.
+- **Is the image public?** Login-walled registries fail.
 
-This is a real Day-3 packaging exercise. Build it like a platform engineer would.
+This is a real Day-3 packaging exercise. Read carefully, modify intentionally, ship cleanly.
